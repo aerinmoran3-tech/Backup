@@ -5,6 +5,8 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import { useForm } from "react-hook-form";
 import * as z from "zod";
 import { cn } from "@/lib/utils";
+import { encodeForTransmission } from "@/lib/client-encryption";
+import { captureSignatureMetadata, validateSignatureMetadata } from "@/lib/signature-service";
 import {
   FileText,
   MapPin,
@@ -55,7 +57,14 @@ const applyFormSchema = z.object({
   firstName: z.string().min(2, "First name is required"),
   lastName: z.string().min(2, "Last name is required"),
   email: z.string().email("Valid email address is required"),
-  phone: z.string().min(10, "Phone number is required"),
+  phone: z.string()
+    .min(10, "Phone number must be at least 10 digits")
+    .regex(/^[0-9\-\(\)\s\+]{10,}$/, "Phone number can only contain digits, spaces, hyphens, parentheses, and plus sign")
+    .refine(val => {
+      // Remove non-digits and check if we have at least 10 unique digits for a valid phone
+      const digitsOnly = val.replace(/\D/g, '');
+      return digitsOnly.length >= 10 && !/^(\d)\1{9,}$/.test(digitsOnly); // Not all same digit
+    }, "Please enter a valid phone number"),
   dateOfBirth: z.string().refine((date) => {
     if (!date) return false;
     const birthDate = new Date(date);
@@ -72,8 +81,16 @@ const applyFormSchema = z.object({
   // Employment
   employerName: z.string().min(2, "Employer name is required"),
   jobTitle: z.string().min(2, "Job title is required"),
-  monthlyIncome: z.string().min(1, "Monthly income is required"),
-  employmentDuration: z.string().min(1, "Employment duration is required"),
+  monthlyIncome: z.string()
+    .min(1, "Monthly income is required")
+    .regex(/^\d+(\.\d{1,2})?$/, "Monthly income must be a valid number (e.g., 5000 or 5000.50)")
+    .transform(val => parseFloat(val))
+    .refine(val => val > 0 && val <= 999999999, "Monthly income must be between $0.01 and $999,999,999"),
+  employmentDuration: z.string()
+    .min(1, "Employment duration is required")
+    .regex(/^\d+$/, "Employment duration must be a whole number")
+    .transform(val => parseInt(val, 10))
+    .refine(val => val >= 0 && val <= 1200, "Employment duration must be between 0 and 1200 months (0-100 years)"),
 
   // Emergency Contact
   emergencyContactName: z.string().min(2, "Emergency contact name is required"),
@@ -83,7 +100,11 @@ const applyFormSchema = z.object({
   // Rental History
   currentLandlordName: z.string().optional(),
   currentLandlordPhone: z.string().optional(),
-  currentRentAmount: z.string().optional(),
+  currentRentAmount: z.string()
+    .optional()
+    .refine(val => !val || /^\d+(\.\d{1,2})?$/.test(val), "Current rent must be a valid number if provided")
+    .transform(val => val ? parseFloat(val) : undefined)
+    .refine(val => !val || (val > 0 && val <= 999999999), "Current rent must be between $0.01 and $999,999,999 if provided"),
   reasonForMoving: z.string().optional(),
 
   // Reference
@@ -272,10 +293,23 @@ export default function Apply() {
 
     setSaveStatus('saving');
     try {
-      const payload = {
+      // SECURITY: Encrypt sensitive data before transmission
+      const payload: any = {
         step: step,
         ...values
       };
+
+      // If personalInfo exists and contains SSN, encrypt it before sending
+      if (payload.personalInfo?.ssn) {
+        const ssn = payload.personalInfo.ssn;
+        if (typeof ssn === 'string' && ssn.length > 0 && !ssn.includes('REDACTED')) {
+          // Only encrypt if it looks like raw SSN, not already encrypted
+          payload.personalInfo = {
+            ...payload.personalInfo,
+            ssn: encodeForTransmission(ssn.replace(/\D/g, '')) // Remove formatting, then encode
+          };
+        }
+      }
 
       let response;
       if (applicationId) {
@@ -319,10 +353,40 @@ export default function Apply() {
 
     setIsProcessing(true);
     try {
-      const submitResponse = await apiRequest("PATCH", `/api/applications/${applicationId}/status`, { 
+      // CRITICAL: Capture signature metadata for ESIGN Act compliance
+      const signatureMetadata = await captureSignatureMetadata(values.signature);
+      
+      // Validate signature metadata
+      const validation = validateSignatureMetadata(signatureMetadata);
+      if (!validation.valid) {
+        toast({
+          title: "Signature Error",
+          description: validation.errors.join(", "),
+          variant: "destructive",
+        });
+        setIsProcessing(false);
+        return;
+      }
+
+      // Encrypt sensitive data before submission
+      const submitPayload: any = {
         status: "submitted",
-        ...values // Pass all values to ensure backend has everything for final submission
-      });
+        ...values,
+        signatureMetadata, // Include signature metadata for audit trail
+      };
+
+      // Encrypt SSN if present
+      if (submitPayload.personalInfo?.ssn) {
+        const ssn = submitPayload.personalInfo.ssn;
+        if (typeof ssn === 'string' && ssn.length > 0 && !ssn.includes('REDACTED')) {
+          submitPayload.personalInfo = {
+            ...submitPayload.personalInfo,
+            ssn: encodeForTransmission(ssn.replace(/\D/g, ''))
+          };
+        }
+      }
+
+      const submitResponse = await apiRequest("PATCH", `/api/applications/${applicationId}/status`, submitPayload);
 
       if (!submitResponse.ok) {
         const errorData = await submitResponse.json().catch(() => ({}));
@@ -634,10 +698,11 @@ export default function Apply() {
                           name="employmentDuration"
                           render={({ field }) => (
                             <FormItem>
-                              <FormLabel>Duration</FormLabel>
+                              <FormLabel>Duration (Months)</FormLabel>
                               <FormControl>
-                                <Input placeholder="2 Years" {...field} onBlur={() => handleBlur("employmentDuration")} />
+                                <Input placeholder="12" {...field} onBlur={() => handleBlur("employmentDuration")} type="number" min="0" max="1200" />
                               </FormControl>
+                              <FormDescription>How long have you worked at this job? Enter in months (e.g., 12 for 1 year)</FormDescription>
                               <FormMessage />
                             </FormItem>
                           )}
@@ -1009,16 +1074,32 @@ export default function Apply() {
                         name="signature"
                         render={({ field }) => (
                           <FormItem>
-                            <FormLabel>Electronic Signature</FormLabel>
+                            <FormLabel className="flex items-center gap-2">
+                              <Shield className="h-4 w-4 text-green-600" />
+                              Electronic Signature (ESIGN Act Compliant)
+                            </FormLabel>
                             <FormControl>
                               <Input 
                                 placeholder="Type your full legal name" 
                                 {...field}
                                 onBlur={() => handleBlur("signature")}
+                                autoComplete="name"
+                                className="font-semibold"
                               />
                             </FormControl>
-                            <FormDescription>
-                              By typing your name, you are legally signing this application
+                            <FormDescription className="space-y-2">
+                              <p className="text-xs">
+                                ✓ By typing your full legal name above, you electronically sign this rental application under penalty of perjury.
+                              </p>
+                              <p className="text-xs">
+                                ✓ This signature is legally binding under the ESIGN Act (15 U.S.C. § 7001 et seq.).
+                              </p>
+                              <p className="text-xs">
+                                ✓ Your signature timestamp, device information, and IP address will be recorded for audit trail purposes.
+                              </p>
+                              <p className="text-xs">
+                                ✓ You consent to receive this application electronically and retain a copy for your records.
+                              </p>
                             </FormDescription>
                             <FormMessage />
                           </FormItem>

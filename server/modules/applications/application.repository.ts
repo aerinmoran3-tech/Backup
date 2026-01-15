@@ -91,13 +91,13 @@ export async function checkDuplicateApplication(
     .eq("property_id", propertyId)
     .limit(1);
 
-  // ❗ DO NOT throw here — duplicate check must be safe
+  // ❗ CRITICAL: Must throw on database error to prevent duplicate applications
   if (error) {
-    console.warn(
-      "[APPLICATION_REPO] duplicate check failed, allowing create",
+    console.error(
+      "[APPLICATION_REPO] duplicate check failed - rejecting application",
       error
     );
-    return { exists: false };
+    throw new Error("Unable to verify application uniqueness. Please try again.");
   }
 
   return { exists: (data?.length ?? 0) > 0 };

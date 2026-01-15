@@ -226,6 +226,17 @@ export interface UpdateStatusInput {
   conditionalRequirements?: any[];
   conditionalDocuments?: string[];
   dueDate?: string;
+  signatureMetadata?: {
+    timestamp: string;
+    ipAddress: string;
+    userAgent: string;
+    screenResolution: string;
+    timezone: string;
+    consentGiven: boolean;
+    signatureValue: string;
+    signatureHash: string;
+    deviceFingerprint: string;
+  };
 }
 
 /* ------------------------------------------------ */
@@ -239,6 +250,71 @@ export async function createApplication(
 
   if (!validation.success) {
     return { error: validation.error.errors[0].message };
+  }
+
+  // Additional numeric validation for financial fields
+  const employment = validation.data.employment as any || {};
+  const monthlyIncome = employment.monthlyIncome || employment.income;
+  
+  if (monthlyIncome !== undefined && monthlyIncome !== null) {
+    const incomeNum = typeof monthlyIncome === 'string' ? parseFloat(monthlyIncome) : monthlyIncome;
+    if (isNaN(incomeNum) || incomeNum < 0 || incomeNum > 999999999) {
+      return { error: "Monthly income must be a valid number between $0 and $999,999,999" };
+    }
+  }
+
+  const rentalHistory = validation.data.rentalHistory as any || {};
+  const currentRentAmount = rentalHistory.currentRentAmount;
+  
+  if (currentRentAmount !== undefined && currentRentAmount !== null) {
+    const rentNum = typeof currentRentAmount === 'string' ? parseFloat(currentRentAmount) : currentRentAmount;
+    if (isNaN(rentNum) || rentNum < 0 || rentNum > 999999999) {
+      return { error: "Current rent must be a valid number between $0 and $999,999,999" };
+    }
+  }
+
+  // Backend age verification (frontend validation not enough)
+  const personalInfo = validation.data.personalInfo as any || {};
+  const dateOfBirth = personalInfo.dateOfBirth;
+  if (dateOfBirth) {
+    const birthDate = new Date(dateOfBirth);
+    const today = new Date();
+    let age = today.getFullYear() - birthDate.getFullYear();
+    const m = today.getMonth() - birthDate.getMonth();
+    if (m < 0 || (m === 0 && today.getDate() < birthDate.getDate())) {
+      age--;
+    }
+    
+    if (age < 18) {
+      return { error: "Applicant must be at least 18 years old to apply for a rental property" };
+    }
+    
+    if (age > 150 || birthDate > today) {
+      return { error: "Please provide a valid date of birth" };
+    }
+  }
+
+  // Backend phone validation
+  const phone = personalInfo.phone;
+  if (phone) {
+    const digitsOnly = phone.replace(/\D/g, '');
+    if (digitsOnly.length < 10) {
+      return { error: "Phone number must contain at least 10 digits" };
+    }
+    // Reject all same digits (1111111111)
+    if (/^(\d)\1{9,}$/.test(digitsOnly)) {
+      return { error: "Please enter a valid phone number" };
+    }
+  }
+
+  // Backend employment duration validation
+  const employment2 = validation.data.employment as any || {};
+  const employmentDuration = employment2.employmentDuration;
+  if (employmentDuration !== undefined && employmentDuration !== null) {
+    const durationNum = typeof employmentDuration === 'string' ? parseInt(employmentDuration, 10) : employmentDuration;
+    if (isNaN(durationNum) || durationNum < 0 || durationNum > 1200) {
+      return { error: "Employment duration must be between 0 and 1200 months (0-100 years)" };
+    }
   }
 
   const { propertyId } = validation.data;
@@ -424,10 +500,25 @@ export async function autosaveApplication(
     const ssnValue = processedBody.personalInfo.ssn.toString();
     // Only encrypt if it's not already redacted or empty
     if (ssnValue && ssnValue !== "REDACTED" && !ssnValue.includes("*")) {
-      processedBody.personalInfo = {
-        ...processedBody.personalInfo,
-        ssn: encrypt(ssnValue.replace(/\D/g, ""))
-      };
+      // Check if it's base64 encoded (from client-side encryption)
+      let decrypted = ssnValue;
+      try {
+        // Try to decode if it's base64
+        if (/^[A-Za-z0-9+/=]+$/.test(ssnValue)) {
+          decrypted = Buffer.from(ssnValue, 'base64').toString('utf-8');
+        }
+      } catch (e) {
+        // Not base64, use as-is
+      }
+      
+      // Clean and encrypt
+      const cleanedSSN = decrypted.replace(/\D/g, '');
+      if (cleanedSSN.length === 9) {
+        processedBody.personalInfo = {
+          ...processedBody.personalInfo,
+          ssn: encrypt(cleanedSSN)
+        };
+      }
     } else if (ssnValue === "REDACTED" || ssnValue.includes("*")) {
       // Prevent overwriting the real encrypted SSN with a masked version
       const { ssn, ...rest } = processedBody.personalInfo;
@@ -974,6 +1065,15 @@ export async function updateStatus(
     status_history: [...(application.status_history || []), historyEntry],
     updated_at: new Date().toISOString(),
   };
+
+  // Store signature metadata if provided (for submission with signature metadata)
+  if (input.signatureMetadata && input.status === "submitted") {
+    updatePayload.signature_metadata = {
+      ...input.signatureMetadata,
+      ipAddress: input.signatureMetadata.ipAddress || '', // Will be updated by auth middleware
+      submittedAt: new Date().toISOString(),
+    };
+  }
 
   if (input.status === "submitted" && input.legalAcceptance === true) {
     const activeDocs = await legalRepository.getActiveLegalDocuments();

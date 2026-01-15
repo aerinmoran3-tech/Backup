@@ -393,6 +393,19 @@ router.post("/:id/pay", authenticateToken, async (req: AuthenticatedRequest, res
       return res.status(400).json(errorResponse("Payment request data is missing"));
     }
 
+    // CRITICAL: Validate payment amount matches stored snapshot
+    const amount = parseFloat(paymentRequest.amount);
+    const applicationFee = parseFloat(application.applicationFeeSnapshot || application.application_fee_snapshot || "0");
+    
+    if (isNaN(amount) || amount <= 0 || amount > 999999) {
+      return res.status(400).json(errorResponse("Invalid payment amount"));
+    }
+
+    // Warn if amount significantly differs from application fee (allow 10% variance for rounding)
+    if (applicationFee > 0 && Math.abs(amount - applicationFee) > (applicationFee * 0.1)) {
+      return res.status(400).json(errorResponse(`Payment amount must match the requested fee of $${applicationFee.toFixed(2)}`));
+    }
+
     // Create a payment_intent placeholder
     // In a real scenario, this would interact with Stripe/etc.
     // For now, we'll store it in a transaction/payment record if available, 
