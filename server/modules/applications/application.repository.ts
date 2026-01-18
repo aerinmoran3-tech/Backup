@@ -132,7 +132,21 @@ export async function createApplication(
     .select()
     .single();
 
-  throwIfError(error, "createApplication");
+  // Handle unique constraint violation gracefully (race condition)
+  if (error) {
+    const errorMessage = error.message?.toLowerCase() || "";
+    if (
+      errorMessage.includes("duplicate") ||
+      errorMessage.includes("unique") ||
+      errorMessage.includes("constraint") ||
+      errorMessage.includes("user_property_unique") ||
+      error.code === "23505" // PostgreSQL unique violation code
+    ) {
+      console.warn("[APPLICATION_REPO] Duplicate application detected - returning null for graceful handling");
+      return null;
+    }
+    throwIfError(error, "createApplication");
+  }
 
   return data;
 }

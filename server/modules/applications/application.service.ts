@@ -15,15 +15,124 @@ import { generateLeasePdf } from "../../services/leaseAgreementPdf";
 /* Constants & Helpers */
 /* ------------------------------------------------ */
 
+// Complete status transition map for application workflow
+// Aligns with APPLICATION_STATUSES in shared/schema.ts
 const STATUS_TRANSITIONS: Record<string, string[]> = {
-  draft: ["submitted", "withdrawn"],
+  draft: ["pending_payment", "withdrawn"],
+  pending_payment: ["payment_verified", "withdrawn"],
+  payment_verified: ["submitted", "withdrawn"],
   submitted: ["under_review", "withdrawn", "payment_requested"],
-  under_review: ["approved", "rejected", "withdrawn", "payment_requested"],
-  payment_requested: ["submitted", "under_review", "withdrawn"],
-  approved: [],
+  under_review: ["info_requested", "conditional_approval", "approved", "rejected", "withdrawn"],
+  info_requested: ["under_review", "withdrawn"],
+  conditional_approval: ["approved", "rejected", "withdrawn"],
+  approved: ["withdrawn"], // Can withdraw before lease is fully signed
   rejected: [],
   withdrawn: [],
 };
+
+/**
+ * Convert camelCase field names to snake_case for database storage
+ * Handles frontend form data that comes in camelCase format
+ */
+function convertToSnakeCase(obj: Record<string, any>): Record<string, any> {
+  const fieldMappings: Record<string, string> = {
+    // Personal Info
+    firstName: "first_name",
+    lastName: "last_name",
+    dateOfBirth: "date_of_birth",
+    currentAddress: "current_address",
+    
+    // Employment
+    employerName: "employer_name",
+    jobTitle: "job_title",
+    monthlyIncome: "monthly_income",
+    employmentDuration: "employment_duration",
+    
+    // Emergency Contact
+    emergencyContactName: "emergency_contact_name",
+    emergencyContactPhone: "emergency_contact_phone",
+    emergencyContactRelationship: "emergency_contact_relationship",
+    
+    // Rental History
+    currentLandlordName: "current_landlord_name",
+    currentLandlordPhone: "current_landlord_phone",
+    currentRentAmount: "current_rent_amount",
+    reasonForMoving: "reason_for_moving",
+    
+    // References
+    refName: "ref_name",
+    refPhone: "ref_phone",
+    refRelation: "ref_relation",
+    
+    // Pets & Vehicles
+    hasPets: "has_pets",
+    petDetails: "pet_details",
+    hasVehicles: "has_vehicles",
+    vehicleDetails: "vehicle_details",
+    
+    // Legal
+    hasEvictions: "has_evictions",
+    hasFelonies: "has_felonies",
+    hasBankruptcies: "has_bankruptcies",
+    acknowledgePetPolicy: "acknowledge_pet_policy",
+    acknowledgeSmokingPolicy: "acknowledge_smoking_policy",
+    rulesAcknowledged: "rules_acknowledged",
+    agreeToBackgroundCheck: "agree_to_background_check",
+    agreeToTerms: "agree_to_terms",
+    
+    // Property
+    propertyId: "property_id",
+    
+    // Nested objects that need conversion
+    personalInfo: "personal_info",
+    rentalHistory: "rental_history",
+    employment: "employment",
+    references: "references",
+    disclosures: "disclosures",
+    documents: "documents",
+    documentStatus: "document_status",
+    
+    // State disclosures
+    stateDisclosures: "state_disclosures",
+    customAnswers: "custom_answers",
+    
+    // Application status
+    lastSavedStep: "last_saved_step",
+  };
+
+  const result: Record<string, any> = {};
+
+  for (const [key, value] of Object.entries(obj)) {
+    // Check for direct field mapping first
+    if (fieldMappings[key]) {
+      if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+        result[fieldMappings[key]] = convertToSnakeCase(value);
+      } else {
+        result[fieldMappings[key]] = value;
+      }
+    } 
+    // Check if this is a nested object that needs conversion
+    else if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+      result[key] = convertToSnakeCase(value);
+    } 
+    // Handle arrays with objects
+    else if (Array.isArray(value)) {
+      result[key] = value.map((item) => {
+        if (item !== null && typeof item === 'object' && !Array.isArray(item)) {
+          return convertToSnakeCase(item);
+        }
+        return item;
+      });
+    } 
+    // Regular field - convert camelCase to snake_case automatically
+    else {
+      const snakeKey = key.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`);
+      result[snakeKey] = value;
+    }
+  }
+
+  return result;
+}
 
 export function isValidStatusTransition(
   currentStatus: string,
@@ -339,27 +448,30 @@ export async function createApplication(
     };
   }
 
+// Convert camelCase to snake_case for database storage
+  const convertedData = convertToSnakeCase(validation.data);
+
   const applicationPayload = {
-    ...validation.data,
+    ...convertedData,
     user_id: input.userId,
     status: "draft",
-    customAnswers: validation.data.customAnswers || {},
-    stateDisclosures: validation.data.stateDisclosures || {},
-    // Encrypt SSN if provided in personalInfo
-    personalInfo: validation.data.personalInfo ? {
-      ...(validation.data.personalInfo as object),
-      ssn: (validation.data.personalInfo as any).ssn ? encrypt((validation.data.personalInfo as any).ssn.toString()) : undefined
+    customAnswers: convertedData.custom_answers || {},
+    stateDisclosures: convertedData.state_disclosures || {},
+    // Encrypt SSN if provided in personal_info
+    personalInfo: convertedData.personal_info ? {
+      ...(convertedData.personal_info as object),
+      ssn: (convertedData.personal_info as any).ssn ? encrypt((convertedData.personal_info as any).ssn.toString()) : undefined
     } : undefined,
     // Snapshot pricing & lease terms
     rentSnapshot: property.price ? property.price.toString() : "0.00",
-    depositSnapshot: property.price ? property.price.toString() : "0.00", 
-    applicationFeeSnapshot: property.application_fee || property.applicationFee || "50.00",
-    leaseTermSnapshot: property.lease_term || property.leaseTerm || "12 Months",
-    availableDateSnapshot: property.available_date || property.availableDate || null,
+    depositSnapshot: property.price ? property.price.toString() : "0.00",
+    applicationFeeSnapshot: property.application_fee || "50.00",
+    leaseTermSnapshot: property.lease_term || "12 Months",
+    availableDateSnapshot: property.available_date || null,
     // Property Context
     propertyTitleSnapshot: property.title,
     propertyAddressSnapshot: property.address,
-    propertyTypeSnapshot: property.property_type || property.propertyType || "Residential",
+    propertyTypeSnapshot: property.property_type || "Residential",
     // Rules & Policies snapshot
     policiesSnapshot: {
       petPolicy: property.pets_allowed ? "Pets Allowed" : (property.pets_allowed === false ? "No Pets" : null),
@@ -379,11 +491,11 @@ export async function createApplication(
     ],
   };
 
-  const application =
-    await applicationRepository.createApplication(applicationPayload);
+  const application = await applicationRepository.createApplication(applicationPayload);
 
+  // Handle race condition where duplicate check passed but insert failed due to unique constraint
   if (!application?.id) {
-    return { error: "Failed to create application" };
+    return { error: "You have already applied for this property. Duplicate applications are not allowed." };
   }
 
   // Calculate initial score
@@ -526,7 +638,7 @@ export async function autosaveApplication(
     }
   }
 
-  // Ensure stateDisclosures and customAnswers are included in partial update
+// Ensure stateDisclosures and customAnswers are included in partial update
   if (processedBody.stateDisclosures) {
     processedBody.state_disclosures = processedBody.stateDisclosures;
   }
@@ -534,13 +646,16 @@ export async function autosaveApplication(
     processedBody.custom_answers = processedBody.customAnswers;
   }
 
+  // Convert camelCase to snake_case for partial updates
+  const convertedBody = convertToSnakeCase(processedBody);
+
   // Track lastSavedStep
-  if (processedBody.step !== undefined) {
-    processedBody.lastSavedStep = processedBody.step;
+  if (convertedBody.step !== undefined) {
+    convertedBody.last_saved_step = convertedBody.step;
   }
 
   // Partial update without strict validation
-  const data = await applicationRepository.updateApplication(id, processedBody);
+  const data = await applicationRepository.updateApplication(id, convertedBody);
 
   return { data };
 }
